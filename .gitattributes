@@ -1,0 +1,12 @@
+# Normalize line endings.
+* text=auto eol=lf
+
+# Keep only the addon in downloaded archives.
+/.gitattributes export-ignore
+/.gitignore     export-ignore
+/project.godot  export-ignore
+/icon.svg       export-ignore
+/screenshots    export-ignore
+/docs           export-ignore
+/README.md      export-ignore
+/LICENSE        export-ignore
