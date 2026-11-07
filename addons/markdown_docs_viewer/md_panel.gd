@@ -68,7 +68,7 @@ func _render(keep_scroll := false) -> void:
 	_title.text = current_path.get_file()
 	_title.tooltip_text = current_path
 
-	var renderer := Renderer.new(_style)
+	var renderer := Renderer.new(_style, current_path)
 	renderer.link_clicked.connect(_on_link)
 	var doc: VBoxContainer = renderer.build(Parser.parse(FileAccess.get_file_as_string(current_path)))
 	if _doc:

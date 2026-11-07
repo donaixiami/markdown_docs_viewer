@@ -9,20 +9,31 @@ const Inline := preload("md_inline.gd")
 const Highlight := preload("md_highlight.gd")
 const Style := preload("md_style.gd")
 const I18n := preload("md_i18n.gd")
+const Math := preload("md_math.gd")
 
 var s: Style
 var anchors := {}  # Heading slug -> node, used for jumping.
 var headings: Array[Dictionary] = []  # Data for the outline.
 var _hl: Highlight
 var _first := true
+var document_path := ""
+var _toc_nodes: Array[VBoxContainer] = []
+var _definitions := {}
 
 
-func _init(style: Style) -> void:
+func _init(style: Style, path := "") -> void:
 	s = style
+	document_path = path
 	_hl = Highlight.new(style.text)
 
 
 func build(blocks: Array[Dictionary]) -> VBoxContainer:
+	anchors.clear()
+	headings.clear()
+	_toc_nodes.clear()
+	_first = true
+	_definitions.clear()
+	_collect_definitions(blocks)
 	var box := VBoxContainer.new()
 	box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	box.add_theme_constant_override("separation", s.px(14))
@@ -31,18 +42,40 @@ func build(blocks: Array[Dictionary]) -> VBoxContainer:
 		if c:
 			box.add_child(c)
 		_first = false
+	for toc in _toc_nodes:
+		for heading in headings:
+			var entry := MarginContainer.new()
+			entry.add_theme_constant_override("margin_left", s.px((int(heading.level) - 1) * 18))
+			entry.add_child(rich("[url=#%s]%s[/url]" % [heading.slug, Inline.escape(heading.text)], 0, s.accent))
+			toc.add_child(entry)
+		if headings.is_empty(): toc.add_child(rich("暂无标题 / No headings", 0, s.muted))
 	return box
 
 
 func _block(b: Dictionary) -> Control:
 	match b.type:
 		"heading": return _heading(b)
-		"para": return rich(Inline.to_bbcode(b.text, s))
+		"para": return rich(_inline(b.text))
 		"code": return _code(b)
 		"table": return _table(b)
 		"list": return _list(b)
 		"quote": return _quote(b)
 		"hr": return _hr()
+		"frontmatter":
+			var panel := PanelContainer.new()
+			panel.add_theme_stylebox_override("panel", s.box(s.code_bg, 4, Vector2(14, 10), s.border, 1))
+			var empty: bool = str(b.text).strip_edges().is_empty()
+			panel.add_child(rich(Inline.escape("YAML Front Matter（空）" if empty else str(b.text)), s.size_code, s.muted if empty else s.text, s.font_mono))
+			panel.tooltip_text = "YAML Front Matter"
+			return panel
+		"definition": return _definition(b)
+		"image": return _image(b)
+		"math": return _math(b)
+		"toc":
+			var toc := VBoxContainer.new()
+			toc.add_theme_constant_override("separation", s.px(5))
+			_toc_nodes.append(toc)
+			return toc
 	return null
 
 
@@ -88,7 +121,7 @@ func _heading(b: Dictionary) -> Control:
 	v.add_theme_constant_override("separation", s.px(10))
 	m.add_child(v)
 	var color: Color = s.muted if level == 6 else s.heading
-	v.add_child(rich(Inline.to_bbcode(b.text, s), s.heading_size(level), color, s.font_bold))
+	v.add_child(rich(_inline(b.text), s.heading_size(level), color, s.font_bold))
 	if level <= 2:
 		v.add_child(_line(s.border))
 	anchors[slug] = m
@@ -171,21 +204,22 @@ func _table(b: Dictionary) -> Control:
 	var cols: int = b.header.size()
 	# The frame color doubles as grid lines: cells leave a 1px gap that shows it through.
 	var frame := PanelContainer.new()
-	frame.add_theme_stylebox_override("panel", s.box(s.border, 8, Vector2(1, 1)))
+	frame.add_theme_stylebox_override("panel", s.box(s.border, 3, Vector2(1, 1)))
 	frame.clip_children = CanvasItem.CLIP_CHILDREN_AND_DRAW
-	frame.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
+	frame.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	var grid := GridContainer.new()
 	grid.columns = cols
+	grid.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	grid.add_theme_constant_override("h_separation", maxi(1, s.px(1)))
 	grid.add_theme_constant_override("v_separation", maxi(1, s.px(1)))
 	frame.add_child(grid)
-	var alt: Color = s.bg.lerp(s.surface, 0.55)
+	var alt: Color = s.bg.blend(s.row_alt)
 	for c in cols:
-		grid.add_child(_cell("[b]%s[/b]" % Inline.to_bbcode(b.header[c], s), b.aligns[c] if c < b.aligns.size() else "left", s.surface, s.heading))
+		grid.add_child(_cell("[b]%s[/b]" % _inline(b.header[c]), b.aligns[c] if c < b.aligns.size() else "left", s.surface, s.heading))
 	var row_i := 0
 	for row: PackedStringArray in b.rows:
 		for c in cols:
-			grid.add_child(_cell(Inline.to_bbcode(row[c], s), b.aligns[c] if c < b.aligns.size() else "left", alt if row_i % 2 else s.bg, s.text))
+			grid.add_child(_cell(_inline(row[c]), b.aligns[c] if c < b.aligns.size() else "left", alt if row_i % 2 else s.bg, s.text))
 		row_i += 1
 	# Scroll horizontally when the table is too wide.
 	var scroll := ScrollContainer.new()
@@ -196,13 +230,14 @@ func _table(b: Dictionary) -> Control:
 
 func _cell(bbcode: String, align: String, bg: Color, color: Color) -> Control:
 	var p := PanelContainer.new()
-	p.add_theme_stylebox_override("panel", s.box(bg, 0, Vector2(14, 7)))
-	p.size_flags_horizontal = Control.SIZE_FILL
+	p.add_theme_stylebox_override("panel", s.box(bg, 0, Vector2(16, 10)))
+	p.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	p.custom_minimum_size = Vector2(s.px(90), s.px(40))
 	if align == "center":
 		bbcode = "[center]%s[/center]" % bbcode
 	elif align == "right":
 		bbcode = "[right]%s[/right]" % bbcode
-	var label := rich(bbcode, 0, color, null, false)
+	var label := rich(bbcode if not bbcode.is_empty() else " ", 0, color, null, true)
 	label.size_flags_vertical = Control.SIZE_SHRINK_CENTER  # Vertically center when cells in a row differ in height.
 	p.add_child(label)
 	return p
@@ -248,7 +283,7 @@ func _list(b: Dictionary) -> Control:
 		for deeper in counters.keys():
 			if deeper > level:
 				counters.erase(deeper)
-		row.add_child(rich(Inline.to_bbcode(item.text, s), 0, color))
+		row.add_child(rich(_inline(item.text), 0, color))
 		v.add_child(row)
 	return v
 
@@ -272,3 +307,127 @@ func _quote(b: Dictionary) -> Control:
 			v.add_child(c)
 	p.add_child(v)
 	return p
+
+
+static func resolve_image_path(value: String, doc_path: String) -> String:
+	var path := value.strip_edges().replace("\\", "/")
+	if path.begins_with("file:///"):
+		path = path.trim_prefix("file://").uri_decode()
+		if path.length() > 3 and path[2] == ":": path = path.substr(1)
+	elif path.begins_with("file://"):
+		path = "//" + path.trim_prefix("file://").uri_decode()
+	else: path = path.uri_decode()
+	if path.begins_with("res://") or path.begins_with("user://") or path.is_absolute_path(): return path.simplify_path()
+	return doc_path.replace("\\", "/").get_base_dir().path_join(path).simplify_path()
+
+
+func _image(b: Dictionary) -> Control:
+	var path := resolve_image_path(b.path, document_path)
+	var reason := ""
+	var texture: Texture2D
+	if str(b.path).begins_with("https://") or str(b.path).begins_with("http://"):
+		reason = "网络图片暂不支持 / Remote image not supported"
+	elif not FileAccess.file_exists(path): reason = "找不到图片 / Image not found"
+	else:
+		# Image.load also handles absolute paths outside res:// without an import step.
+		var img := Image.new()
+		if img.load(ProjectSettings.globalize_path(path)) == OK and not img.is_empty():
+			texture = ImageTexture.create_from_image(img)
+		else: reason = "无法读取图片 / Cannot decode image"
+	if texture == null:
+		var fallback := rich(Inline.escape(reason + ": " + str(b.alt)), 0, s.muted)
+		fallback.tooltip_text = path
+		return fallback
+	var view := TextureRect.new()
+	view.texture = texture
+	view.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	view.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	view.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	view.tooltip_text = (str(b.title) if not str(b.title).is_empty() else str(b.alt)) + "\n" + path
+	var ratio := float(texture.get_height()) / texture.get_width()
+	view.resized.connect(func():
+		view.custom_minimum_size.y = maxf(1, minf(view.size.x, texture.get_width()) * ratio))
+	return view
+
+
+func _math(b: Dictionary) -> Control:
+	var formula := Math.new()
+	formula.configure(b.text, s.font, s.font_italic, roundi(s.size_body * 1.2), s.text)
+	formula.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	var scroll := ScrollContainer.new()
+	scroll.vertical_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	scroll.add_child(formula)
+	if formula.error.is_empty(): return scroll
+	var box := VBoxContainer.new()
+	box.add_child(scroll)
+	box.add_child(rich(Inline.escape("公式暂不支持此语法，保留原文 / " + formula.error), 0, s.muted))
+	return box
+
+
+func _collect_definitions(blocks: Array[Dictionary]) -> void:
+	for b in blocks:
+		if b.type == "definition" and not str(b.id).is_empty():
+			var key := ("^" if b.footnote else "") + str(b.id).to_lower()
+			if not _definitions.has(key): _definitions[key] = b
+		elif b.type == "quote": _collect_definitions(b.blocks)
+
+
+func _definition(b: Dictionary) -> Control:
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", s.px(10))
+	var marker := "[" + ("^" if b.footnote else "") + str(b.id) + "]:"
+	var label := rich(Inline.escape(marker), s.size_code, s.muted, s.font_mono, false)
+	label.size_flags_horizontal = Control.SIZE_FILL
+	row.add_child(label)
+	var value := str(b.text)
+	var body: RichTextLabel
+	if value.strip_edges().is_empty():
+		body = rich("脚注内容为空 / Empty footnote" if b.footnote else "链接地址为空 / Empty link", s.size_code, s.muted)
+	elif b.footnote:
+		body = rich(Inline.to_bbcode(value, s), s.size_code)
+	else:
+		var target := _reference_target(value)
+		body = rich("[url=%s][color=#%s]%s[/color][/url]" % [target, s.accent.to_html(), Inline.escape(value)] if not target.is_empty() else Inline.escape(value), s.size_code)
+	row.add_child(body)
+	if b.footnote and not str(b.id).is_empty():
+		var key := "footnote-" + str(b.id).to_lower()
+		if not anchors.has(key): anchors[key] = row
+	return row
+
+
+func _reference_target(value: String) -> String:
+	var m := RegEx.create_from_string(r'^\s*(?:<([^>]+)>|(\S+))').search(value)
+	if not m: return ""
+	var target := m.get_string(1) if not m.get_string(1).is_empty() else m.get_string(2)
+	return target.replace("[", "%5B").replace("]", "%5D").replace(" ", "%20")
+
+
+func _inline(value: String) -> String:
+	# Keep code spans opaque and feed ordinary text through the existing formatter.
+	var tokens: Array[String] = []
+	var masked := ""
+	var at := 0
+	var pattern := RegEx.create_from_string(r'(`+)(.+?)\1|(?<!!)\[\^([^\]]+)\]|(?<!!)\[([^\]]+)\]\[([^\]]*)\]')
+	for m in pattern.search_all(value):
+		masked += value.substr(at, m.get_start() - at)
+		var replacement := ""
+		if not m.get_string(1).is_empty():
+			masked += m.get_string()
+			at = m.get_end()
+			continue
+		if not m.get_string(3).is_empty():
+			var id := m.get_string(3).to_lower()
+			if _definitions.has("^" + id): replacement = "[url=#footnote-%s][color=#%s][font_size=%d]〔%s〕[/font_size][/color][/url]" % [id.uri_encode(), s.accent.to_html(), maxi(9, roundi(s.size_body * 0.8)), Inline.escape(m.get_string(3))]
+		else:
+			var id := m.get_string(5) if not m.get_string(5).is_empty() else m.get_string(4)
+			if _definitions.has(id.to_lower()):
+				var target := _reference_target(_definitions[id.to_lower()].text)
+				if not target.is_empty(): replacement = "[url=%s][color=#%s]%s[/color][/url]" % [target, s.accent.to_html(), Inline.to_bbcode(m.get_string(4), s)]
+		if replacement.is_empty(): masked += m.get_string()
+		else:
+			masked += "\ue100" + str(tokens.size()) + "\ue101"
+			tokens.append(replacement)
+		at = m.get_end()
+	var output := Inline.to_bbcode(masked + value.substr(at), s)
+	for index in tokens.size(): output = output.replace("\ue100" + str(index) + "\ue101", tokens[index])
+	return output

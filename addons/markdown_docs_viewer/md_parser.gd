@@ -7,18 +7,34 @@ static var _re_heading := RegEx.create_from_string(r"^\s{0,3}(#{1,6})\s+(.*?)\s*
 static var _re_hr := RegEx.create_from_string(r"^\s{0,3}([-*_])(\s*\1){2,}\s*$")
 static var _re_list := RegEx.create_from_string(r"^(\s*)([-*+]|\d+[.)])\s+(.*)$")
 static var _re_table_sep := RegEx.create_from_string(r"^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$")
+static var _re_image := RegEx.create_from_string(r'^!\[([^\]]*)\]\(\s*(?:<([^>]+)>|(.+?))(?:\s+"([^"]*)")?\s*\)$')
+static var _re_definition := RegEx.create_from_string(r"^ {0,3}\[(\^?)([^\]]*)\]:[ \t]*(.*)$")
 
 
-static func parse(src: String) -> Array[Dictionary]:
-	var lines := src.replace("\r\n", "\n").replace("\t", "    ").split("\n")
+static func parse(src: String, front_matter := true) -> Array[Dictionary]:
+	var lines := src.trim_prefix("\ufeff").replace("\r\n", "\n").replace("\t", "    ").split("\n")
 	var blocks: Array[Dictionary] = []
 	var i := 0
 	var n := lines.size()
+	if front_matter and n > 1 and lines[0].strip_edges() == "---":
+		for end in range(1, n):
+			if lines[end].strip_edges() in ["---", "..."]:
+				blocks.append({type = "frontmatter", text = "\n".join(lines.slice(1, end))})
+				i = end + 1
+				break
 	while i < n:
 		var line: String = lines[i]
 		var stripped := line.strip_edges()
 		if stripped.is_empty():
 			i += 1
+		elif _re_definition.search(line):
+			var m := _re_definition.search(line)
+			var body := m.get_string(3)
+			i += 1
+			while i < n and lines[i].begins_with("    "):
+				body += "\n" + lines[i].substr(4)
+				i += 1
+			blocks.append({type = "definition", footnote = m.get_string(1) == "^", id = m.get_string(2), text = body})
 		elif stripped.begins_with("<!--"):
 			# HTML comments may span several lines; skip the whole thing.
 			while i < n and not lines[i].contains("-->"):
@@ -37,6 +53,29 @@ static func parse(src: String) -> Array[Dictionary]:
 			var m := _re_heading.search(line)
 			blocks.append({type = "heading", level = m.get_string(1).length(), text = m.get_string(2)})
 			i += 1
+		elif _re_image.search(stripped):
+			var m := _re_image.search(stripped)
+			blocks.append({type = "image", alt = m.get_string(1), path = m.get_string(2) if not m.get_string(2).is_empty() else m.get_string(3), title = m.get_string(4)})
+			i += 1
+		elif stripped.to_lower() == "[toc]":
+			blocks.append({type = "toc"})
+			i += 1
+		elif stripped.begins_with("$$"):
+			var formula := stripped.substr(2)
+			var end := i
+			if not formula.ends_with("$$") or formula.is_empty():
+				end = i + 1
+				while end < n and not lines[end].strip_edges().ends_with("$$"):
+					formula += "\n" + lines[end]
+					end += 1
+				if end < n: formula += "\n" + lines[end].strip_edges()
+			if end < n:
+				blocks.append({type = "math", text = formula.trim_suffix("$$").strip_edges()})
+				i = end + 1
+			else:
+				# Preserve unfinished input instead of swallowing the rest of the document.
+				blocks.append({type = "para", text = stripped})
+				i += 1
 		elif _re_hr.search(line):
 			blocks.append({type = "hr"})
 			i += 1
@@ -47,7 +86,7 @@ static func parse(src: String) -> Array[Dictionary]:
 			while i < n and lines[i].strip_edges().begins_with(">"):
 				inner.append(lines[i].strip_edges().trim_prefix(">").trim_prefix(" "))
 				i += 1
-			blocks.append({type = "quote", blocks = parse("\n".join(inner))})
+			blocks.append({type = "quote", blocks = parse("\n".join(inner), false)})
 		elif _re_list.search(line):
 			i = _parse_list(lines, i, blocks)
 		else:
@@ -147,5 +186,6 @@ static func _parse_paragraph(lines: PackedStringArray, i: int, blocks: Array[Dic
 
 static func _starts_block(line: String) -> bool:
 	var s := line.strip_edges()
+	if _re_definition.search(line): return true
 	return s.begins_with("#") or s.begins_with("```") or s.begins_with("~~~") or s.begins_with(">") \
-		or s.begins_with("|") or _re_hr.search(line) != null or _re_list.search(line) != null
+		or s.begins_with("|") or s.begins_with("$$") or s.to_lower() == "[toc]" or _re_image.search(s) != null or _re_hr.search(line) != null or _re_list.search(line) != null
